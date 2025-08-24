@@ -477,6 +477,11 @@ class Scheduler:
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
 
+        # CUSTOM MODIFICATION: Add an aging factor for priority
+        # This value determines how quickly a request's priority increases over time.
+        # A higher value means faster aging. Set to 0.0 to disable.
+        self.priority_aging_factor = 0.1  # Example value, can be configured
+        
         # The following field is test-only. It is used to inject artificial
         # preemption.
         self.enable_artificial_preemption = ENABLE_ARTIFICIAL_PREEMPT
@@ -551,6 +556,33 @@ class Scheduler:
         # Add sequence groups to the swapped queue.
         # Only for testing purposes.
         self.swapped.append(seq_group)
+    # CUSTOM MODIFICATION: New method to get priority with aging
+    def _get_priority(self,
+                      seq_group: SequenceGroup) -> Tuple[Optional[int], float]:
+        """Get the effective priority of the sequence group.
+        
+        Combines user-defined priority with an aging factor to prevent starvation.
+        """
+        user_priority = seq_group.priority if seq_group.priority is not None else 0
+        arrival_time = seq_group.arrival_time
+        
+        # Aging calculation: priority increases the longer a request waits.
+        # The lower the final value, the higher the priority.
+        time_waiting = time.time() - arrival_time
+        aging_penalty = time_waiting * self.priority_aging_factor
+        
+        # Final priority is a combination of user priority and arrival time, adjusted by aging.
+        # We subtract the aging penalty to increase the priority over time.
+        return (user_priority, arrival_time - aging_penalty)
+
+    def _sort_queues_by_priority(self) -> None:
+        """Sorts waiting and running queues by priority."""
+        # The key function uses our new _get_priority method
+        self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+        self.running = deque(sorted(self.running, key=self._get_priority))
+        
+        # Swapped queue can also be sorted to prioritize which requests to swap back in first
+        self.swapped = deque(sorted(self.swapped, key=self._get_priority))
 
     def abort_seq_group(
         self,
@@ -959,69 +991,66 @@ class Scheduler:
         self,
         budget: SchedulingBudget,
     ) -> int:
-        """Sorts waiting and running queue. Also, force preempt requests
-        from the running queue if their priority is lower.
-        Priority-based preemption is used with the priority policy.
-        Args:
-            budget: The scheduling budget. The argument is in-place updated
-                when any requests are scheduled.
-        Returns:
-            A count of priority-based preemptions.
         """
+        如果高优先级请求正在等待且资源稀缺，则执行抢占。
 
-        waiting_queue = self.waiting
+        它会检查优先级最高的等待中请求。如果该请求无法被调度，
+        此方法将抢占运行队列中优先级最低的请求，直到高优先级请求可以被调度，
+        或者没有更多可抢占的请求为止。
 
-        running_queue = deque(sorted(self.running, key=self._get_priority))
+        返回:
+            被抢占的序列组数量。
+        """
+        if not self.waiting or not self.running:
+            return 0
 
-        blocks_to_swap_out: List[Tuple[int, int]] = []
-        force_preemption_count = 0
+        preemption_count = 0
+        # 检查优先级最高的等待中请求（排序后它在队列头部）
+        highest_priority_waiting_sg = self.waiting[0]
 
-        if waiting_queue:
-            seq_group = waiting_queue.popleft()
-            num_new_seqs = seq_group.get_max_num_running_seqs()
-            num_new_tokens_uncached, _ = \
-                self._get_num_new_uncached_and_cached_tokens(
-                seq_group, SequenceStatus.WAITING, False, budget)
+        # 检查是否能为这个请求分配内存
+        can_allocate = self.block_manager.can_allocate(highest_priority_waiting_sg)
 
-            # Only preempt if priority inversion exists
-            while running_queue and self._get_priority(
-                    running_queue[-1]) > self._get_priority(seq_group):
-                # Only preempt if waiting sequence cannot be allocated
-                can_allocate = self.block_manager.can_allocate(seq_group)
-                if (num_new_tokens_uncached > 0
-                        and can_allocate == AllocStatus.OK
-                        and budget.can_schedule(
-                            num_new_tokens=num_new_tokens_uncached,
-                            num_new_seqs=num_new_seqs,
-                        )):
-                    break
+        # 如果已经可以分配，则无需抢占
+        if can_allocate == AllocStatus.OK:
+            return 0
 
-                # Adjust budget to remove the victim sequence group
-                vseq_group = running_queue.pop()
-                num_running_tokens_uncached, _ = (
-                    self._get_num_new_uncached_and_cached_tokens(
-                        vseq_group, SequenceStatus.RUNNING, False, budget))
-                budget.subtract_num_batched_tokens(
-                    vseq_group.request_id, num_running_tokens_uncached)
-                num_running_seqs = vseq_group.get_max_num_running_seqs()
-                budget.subtract_num_seqs(vseq_group.request_id,
-                                         num_running_seqs)
+        # 从优先级最低的运行中请求开始抢占
+        # running 队列已排序，所以优先级最低的在队尾
+        while self.running:
+            victim_sg = self.running[-1]  # 最后一个元素是优先级最低的
 
-                # Preempt out the victim sequence group
-                self._preempt(vseq_group, blocks_to_swap_out)
-                waiting_queue.appendleft(vseq_group)
-                force_preemption_count += 1
-            # Put the sequence back into the waiting queue
-            waiting_queue.appendleft(seq_group)
+            # 安全检查：不要为了一个低优先级的请求去抢占一个更高优先级的请求
+            if self._get_priority(victim_sg) > self._get_priority(highest_priority_waiting_sg):
+                break
 
-            self.remove_seq_from_computed_blocks_tracker(
-                seq_group, SequenceStatus.WAITING)
+            logger.info(f"Preempting request {victim_sg.request_id} "
+                        f"to make space for {highest_priority_waiting_sg.request_id}.")
 
-        waiting_queue = deque(sorted(waiting_queue, key=self._get_priority))
+            # 抢占受害者。我们使用一个临时的 blocks_to_swap_out 列表，
+            # 因为这个函数不需要返回它。
+            blocks_to_swap_out = []
+            preempted_mode = self._preempt(victim_sg, blocks_to_swap_out)
+            
+            # 从 running 队列中移除，并添加到合适的队列中
+            self.running.pop()
+            if preempted_mode == PreemptionMode.RECOMPUTE:
+                self.waiting.appendleft(victim_sg) # 添加回 waiting 队列
+            else: # SWAP
+                self.swapped.appendleft(victim_sg) # 添加到 swapped 队列
 
-        self.waiting = waiting_queue
-        self.running = running_queue
-        return force_preemption_count
+            preemption_count += 1
+            
+            # 抢占后，再次检查高优先级请求是否可以运行
+            if self.block_manager.can_allocate(highest_priority_waiting_sg) == AllocStatus.OK:
+                logger.info(f"Preemption successful. Freed enough space for {highest_priority_waiting_sg.request_id}.")
+                break
+        
+        # 因为我们可能已经将被抢占的请求加回了 waiting 队列，所以需要重新排序
+        if preemption_count > 0:
+            self.waiting = deque(sorted(self.waiting, key=self._get_priority))
+            
+        return preemption_count
 
     def _schedule_prefills(
         self,
@@ -1245,10 +1274,6 @@ class Scheduler:
                                                curr_loras,
                                                enable_chunking=False)
 
-        if len(prefills.seq_groups
-               ) == 0 and self.scheduler_config.policy == "priority":
-            self._schedule_priority_preemption(budget)
-
         # Don't schedule decodes if prefills are scheduled.
         # NOTE: If `_schedule_prefills` doesn't enable chunking, self.running
         # only contains decode requests, not chunked prefills.
@@ -1464,7 +1489,17 @@ class Scheduler:
         return finishing + not_finishing
 
     def _schedule(self) -> SchedulerOutputs:
-        """Schedule queued requests."""
+        """调度排队的请求。"""
+        
+        # 自定义修改：核心逻辑变更
+        # 1. 在每个周期的开始，始终按优先级对队列进行排序。
+        self._sort_queues_by_priority()
+
+        # 2. 如果需要，执行主动抢占。
+        # 这是我们新抢占策略的核心。
+        self._schedule_priority_preemption()
+        
+        # 3. 继续执行原始的调度逻辑（chunked prefill 是首选）
         if self.scheduler_config.chunked_prefill_enabled:
             return self._schedule_chunked_prefill()
         else:

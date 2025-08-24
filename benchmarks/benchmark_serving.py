@@ -1259,6 +1259,11 @@ def create_argument_parser():
         "openai-compatible backends. If not specified, default to greedy "
         "decoding (i.e. temperature==0.0).",
     )
+    parser.add_argument(
+        "--add-random-priority",
+        action="store_true",
+        help="Assign a random priority (-10 for high, 10 for low) to each request to test the priority scheduler.",
+    )
 
     parser.add_argument(
         "--tokenizer-mode",
