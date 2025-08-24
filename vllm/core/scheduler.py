@@ -1880,9 +1880,11 @@ class Scheduler:
         if self.scheduler_config.delay_factor > 0 and self.waiting:
             earliest_arrival_time = min(
                 [e.metrics.arrival_time for e in self.waiting])
+            THROUGHPUT_BOOST_MULTIPLIER = 5
+
             passed_delay = ((now - earliest_arrival_time)
                             > (self.scheduler_config.delay_factor *
-                               self.last_prompt_latency) or not self.running)
+                               self.last_prompt_latency * THROUGHPUT_BOOST_MULTIPLIER) or not self.running)
         else:
             passed_delay = True
         return passed_delay
