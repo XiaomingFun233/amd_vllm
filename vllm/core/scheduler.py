@@ -605,6 +605,28 @@ class Scheduler:
                     del seq_id_to_seq_group[aborted_group.request_id]
 
                 self._free_seq_group_cross_attn_blocks(aborted_group)
+    def _get_prompt_len_for_sorting(self, seq_group: SequenceGroup) -> int:
+        """
+        返回一个序列组的Prompt长度。
+        用于“最短Prompt优先”调度策略。
+        """
+        # 处于WAITING状态的序列组应该只有一个序列。
+        waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+        if waiting_seqs:
+            return waiting_seqs[0].get_len()
+        
+        # 如果序列组因为某些原因不在WAITING状态（例如，一个被抢占后又回到队列的RUNNING任务），
+        # 我们可以给它一个非常小的长度（比如0），以优先处理这些已经在处理过程中的任务。
+        return 0
+
+    # 自定义修改：增加一个新方法，用于对待处理队列进行排序
+    def _sort_waiting_queue_for_throughput(self) -> None:
+        """
+        对等待队列进行排序，以实现“最短Prompt优先”（SPF）策略。
+        这会优先处理Prompt较短的请求，以更快地清理队列，从而可能提升整体吞吐量。
+        """
+        # 排序的key是Prompt的长度，长度越短，排序越靠前。
+        self.waiting = deque(sorted(self.waiting, key=self._get_prompt_len_for_sorting))
 
     def _free_seq_group_cross_attn_blocks(
         self,
@@ -1030,58 +1052,38 @@ class Scheduler:
         enable_chunking: bool = False,
         partial_prefill_metadata: Optional[PartialPrefillMetadata] = None,
     ) -> SchedulerPrefillOutputs:
-        """Schedule sequence groups that are in prefill stage.
-
-        Note that the current scheduler treats PREEMPTED_FOR_RECOMPUTE
-        as a new prefill (that starts from beginning -> most recently generated
-        tokens).
-
-        It schedules waiting requests as long as it fits `budget` and
-        curr_loras <= max_lora from the scheduling config. The input arguments
-        `budget` and `curr_loras` are updated based on scheduled seq_groups.
-
-        Args:
-            budget: The scheduling budget. The argument is in-place updated
-                when any requests are scheduled.
-            curr_loras: Currently batched lora request ids. The argument is
-                in-place updated when any requests are scheduled.
-            enable_chunking: If True, seq group can be chunked and only a
-                chunked number of tokens are scheduled  if
-                `budget.num_batched_tokens` has not enough capacity to schedule
-                all tokens.
-            partial_prefill_metadata: information about the partial prefills
-                that are currently running
-
-        Returns:
-            SchedulerPrefillOutputs.
-        """
-        if budget.remaining_token_budget() == 0:
-            # Do nothing: Can't add any more prefill anyway
-            return SchedulerPrefillOutputs(
-                seq_groups=[],
-                ignored_seq_groups=[],
-                num_lookahead_slots=self._get_num_lookahead_slots(
-                    is_prefill=True, enable_chunking=enable_chunking),
-            )
+        """Schedules sequence groups that are in the prefill stage using
+        a lookahead packing strategy to maximize batch fullness."""
         ignored_seq_groups: List[SequenceGroup] = []
         seq_groups: List[ScheduledSequenceGroup] = []
         using_prompt_embeds: bool = False
 
-        waiting_queue = self.waiting
+        # --- 自定义修改：实现前瞻性打包逻辑 ---
+        waiting_list = list(self.waiting)
+        self.waiting.clear()
+        
+        # This deque will hold requests that are skipped in the current iteration
+        # but should be considered in the next one.
+        skipped_groups: Deque[SequenceGroup] = deque()
 
-        leftover_waiting_sequences: Deque[SequenceGroup] = deque()
-        while self._passed_delay(time.time()) and waiting_queue:
-            seq_group = waiting_queue[0]
+        while waiting_list:
+            seq_group = waiting_list.pop(0)
+
+            # Check if the request has waited long enough (original vLLM logic)
+            if not self._passed_delay(time.time()):
+                skipped_groups.appendleft(seq_group)
+                continue
+
+            # Check for partial prefill limitations
+            if (partial_prefill_metadata is not None
+                    and not partial_prefill_metadata.can_schedule(seq_group)):
+                skipped_groups.append(seq_group)
+                continue
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
             assert len(waiting_seqs) == 1, (
-                "Waiting sequence group should have only one prompt "
-                "sequence.")
-            if (partial_prefill_metadata is not None
-                    and not partial_prefill_metadata.can_schedule(seq_group)):
-                leftover_waiting_sequences.appendleft(seq_group)
-                waiting_queue.popleft()
-                continue
+                "Waiting sequence group should have only one prompt sequence.")
+
             num_new_tokens_uncached, num_new_tokens_cached = (
                 self._get_num_new_uncached_and_cached_tokens(
                     seq_group,
@@ -1092,105 +1094,75 @@ class Scheduler:
                 ))
             num_new_tokens = num_new_tokens_uncached + num_new_tokens_cached
 
-            if not enable_chunking:
-                num_prompt_tokens = waiting_seqs[0].get_len()
-                assert num_new_tokens == num_prompt_tokens
-
+            # Check if prompt is too long
             prompt_limit = self._get_prompt_limit(seq_group)
             if num_new_tokens > prompt_limit:
                 logger.warning(
-                    "Input prompt (%d tokens) is too long"
-                    " and exceeds limit of %d",
-                    num_new_tokens,
-                    prompt_limit,
-                )
+                    "Input prompt (%d tokens) is too long and exceeds limit of %d",
+                    num_new_tokens, prompt_limit)
                 for seq in waiting_seqs:
                     seq.status = SequenceStatus.FINISHED_IGNORED
                 self.remove_seq_from_computed_blocks_tracker(
                     seq_group, SequenceStatus.FINISHED_IGNORED)
                 ignored_seq_groups.append(seq_group)
-                waiting_queue.popleft()
                 continue
 
-            num_lookahead_slots: int = 0
-
-            # If the sequence group cannot be allocated, stop.
-            can_allocate = self.block_manager.can_allocate(
-                seq_group, num_lookahead_slots=num_lookahead_slots)
-            if can_allocate == AllocStatus.LATER:
+            # Check if the request fits the budget. If not, skip and look ahead.
+            num_new_seqs = seq_group.get_max_num_running_seqs()
+            if num_new_tokens_uncached == 0 or not budget.can_schedule(
+                    num_new_tokens=num_new_tokens_uncached,
+                    num_new_seqs=num_new_seqs):
+                skipped_groups.append(seq_group)
                 self.remove_seq_from_computed_blocks_tracker(
                     seq_group, SequenceStatus.WAITING)
-                break
+                continue
+
+            # Check for memory allocation. If cannot allocate now, skip and look ahead.
+            can_allocate = self.block_manager.can_allocate(seq_group)
+            if can_allocate == AllocStatus.LATER:
+                skipped_groups.append(seq_group)
+                self.remove_seq_from_computed_blocks_tracker(
+                    seq_group, SequenceStatus.WAITING)
+                continue
             elif can_allocate == AllocStatus.NEVER:
                 logger.warning(
-                    "Input prompt (%d tokens) + lookahead slots (%d) is "
-                    "too long and exceeds the capacity of block_manager",
-                    num_new_tokens,
-                    num_lookahead_slots,
-                )
+                    "Input prompt (%d tokens) is too long and exceeds the "
+                    "capacity of block_manager", num_new_tokens)
                 for seq in waiting_seqs:
                     seq.status = SequenceStatus.FINISHED_IGNORED
                 self.remove_seq_from_computed_blocks_tracker(
                     seq_group, SequenceStatus.FINISHED_IGNORED)
                 ignored_seq_groups.append(seq_group)
-                waiting_queue.popleft()
                 continue
-
-            # We cannot mix sequence groups that use prompt embeds and
-            # those that do not.
+            
+            # Check for prompt embedding and LoRA conflicts. If conflict, skip.
             if len(seq_groups) == 0:
                 using_prompt_embeds = seq_group.uses_prompt_embeds()
             if using_prompt_embeds != seq_group.uses_prompt_embeds():
+                skipped_groups.append(seq_group)
                 self.remove_seq_from_computed_blocks_tracker(
                     seq_group, SequenceStatus.WAITING)
-                leftover_waiting_sequences.appendleft(seq_group)
-                waiting_queue.popleft()
                 continue
 
             lora_int_id = 0
             if self.lora_enabled:
                 lora_int_id = seq_group.lora_int_id
-                assert curr_loras is not None
-                assert self.lora_config is not None
-                if (self.lora_enabled and lora_int_id > 0
-                        and lora_int_id not in curr_loras
+                assert curr_loras is not None and self.lora_config is not None
+                if (lora_int_id > 0 and lora_int_id not in curr_loras
                         and len(curr_loras) >= self.lora_config.max_loras):
-                    # We don't have a space for another LoRA, so
-                    # we ignore this request for now.
+                    skipped_groups.append(seq_group)
                     self.remove_seq_from_computed_blocks_tracker(
                         seq_group, SequenceStatus.WAITING)
-                    leftover_waiting_sequences.appendleft(seq_group)
-                    waiting_queue.popleft()
                     continue
 
-            if (budget.num_batched_tokens
-                    >= self.scheduler_config.max_num_batched_tokens):
-                # We've reached the budget limit - since there might be
-                # continuous prefills in the running queue, we should break
-                # to avoid scheduling any new prefills.
-                self.remove_seq_from_computed_blocks_tracker(
-                    seq_group, SequenceStatus.WAITING)
-                break
-
-            num_new_seqs = seq_group.get_max_num_running_seqs()
-            if num_new_tokens_uncached == 0 or not budget.can_schedule(
-                    num_new_tokens=num_new_tokens_uncached,
-                    num_new_seqs=num_new_seqs,
-            ):
-                self.remove_seq_from_computed_blocks_tracker(
-                    seq_group, SequenceStatus.WAITING)
-                break
-
-            # Can schedule this request.
+            # If all checks pass, schedule the request.
             if curr_loras is not None and lora_int_id > 0:
                 curr_loras.add(lora_int_id)
-            waiting_queue.popleft()
+            
             self._allocate_and_set_running(seq_group)
-
             if partial_prefill_metadata is not None:
-                partial_prefill_metadata.maybe_increment_partial_prefills(
-                    seq_group)
-
+                partial_prefill_metadata.maybe_increment_partial_prefills(seq_group)
+            
             seq_groups.append(
                 ScheduledSequenceGroup(seq_group=seq_group,
                                        token_chunk_size=num_new_tokens))
@@ -1201,8 +1173,9 @@ class Scheduler:
             )
             budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
-        # Queue requests that couldn't be scheduled.
-        waiting_queue.extendleft(leftover_waiting_sequences)
+        # Put all skipped requests back into the main waiting queue for the next iteration.
+        self.waiting.extend(skipped_groups)
+
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
@@ -1465,6 +1438,7 @@ class Scheduler:
 
     def _schedule(self) -> SchedulerOutputs:
         """Schedule queued requests."""
+        self._sort_waiting_queue_for_throughput()
         if self.scheduler_config.chunked_prefill_enabled:
             return self._schedule_chunked_prefill()
         else:
